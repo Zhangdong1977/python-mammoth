@@ -16,7 +16,8 @@ def convert_document_element_to_html(element,
         convert_image=None,
         id_prefix=None,
         output_format=None,
-        ignore_empty_paragraphs=True):
+        ignore_empty_paragraphs=True,
+        progress_callback=None):
 
     if style_map is None:
         style_map = []
@@ -44,13 +45,19 @@ def convert_document_element_to_html(element,
         ignore_empty_paragraphs=ignore_empty_paragraphs,
         note_references=[],
         comments=comments,
+        progress_callback=progress_callback,
     )
     context = _ConversionContext(is_table_header=False)
     nodes = converter.visit(element, context)
 
+    stripped = html.strip_empty(nodes)
+    collapsed = html.collapse(stripped)
+
     writer = writers.writer(output_format)
-    html.write(writer, html.collapse(html.strip_empty(nodes)))
-    return results.Result(writer.as_string(), messages)
+    html.write(writer, collapsed)
+
+    result = results.Result(writer.as_string(), messages)
+    return result
 
 
 @cobble.data
@@ -62,7 +69,7 @@ class _ConversionContext(object):
 
 
 class _DocumentConverter(documents.element_visitor(args=1)):
-    def __init__(self, messages, style_map, convert_image, id_prefix, ignore_empty_paragraphs, note_references, comments):
+    def __init__(self, messages, style_map, convert_image, id_prefix, ignore_empty_paragraphs, note_references, comments, progress_callback=None):
         self._messages = messages
         self._style_map = style_map
         self._id_prefix = id_prefix
@@ -71,6 +78,7 @@ class _DocumentConverter(documents.element_visitor(args=1)):
         self._referenced_comments = []
         self._convert_image = convert_image
         self._comments = comments
+        self._progress_callback = progress_callback
 
     def visit_image(self, image, context):
         try:
@@ -80,7 +88,7 @@ class _DocumentConverter(documents.element_visitor(args=1)):
             return []
 
     def visit_document(self, document, context):
-        nodes = self._visit_all(document.children, context)
+        nodes = self._visit_all(document.children, context, _report_progress=True)
         notes = [
             document.notes.resolve(reference)
             for reference in self._note_references
@@ -316,12 +324,20 @@ class _DocumentConverter(documents.element_visitor(args=1)):
         ]
 
 
-    def _visit_all(self, elements, context):
-        return [
-            html_node
-            for element in elements
-            for html_node in self.visit(element, context)
-        ]
+    def _visit_all(self, elements, context, _report_progress=False):
+        results = []
+        total = len(elements)
+        for i, element in enumerate(elements):
+            html_nodes = self.visit(element, context)
+            if isinstance(html_nodes, list):
+                results.extend(html_nodes)
+            else:
+                results.append(html_nodes)
+            # Report progress on every element (only for top-level calls)
+            # Backend throttles Redis publishing to avoid overload
+            if _report_progress and self._progress_callback:
+                self._progress_callback(i + 1, total)
+        return results
 
 
     def _find_html_path_for_paragraph(self, paragraph):
@@ -350,6 +366,7 @@ class _DocumentConverter(documents.element_visitor(args=1)):
             document_matcher = style.document_matcher
             if _document_matcher_matches(document_matcher, element, element_type):
                 return style
+        return None
 
     def _note_html_id(self, note):
         return self._referent_html_id(note.note_type, note.note_id)
